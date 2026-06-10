@@ -21,12 +21,25 @@ half-float framebuffers (WebGL2, with a WebGL1 + `OES_texture_half_float` fallba
 
 | Pass | Purpose |
 |---|---|
-| Advection | Semi-Lagrangian transport of velocity and dye |
+| Advection | Semi-Lagrangian for velocity; **MacCormack** (error-corrected, clamped) for dye |
+| Tilt gravity | Density-weighted body force from DeviceMotion (iOS) |
 | Curl + vorticity confinement | Re-injects the small swirls numerics destroy |
 | Divergence + 20× Jacobi pressure | Enforces incompressibility |
 | Gradient subtract | Projects velocity to divergence-free |
-| Bloom (prefilter → blur pyramid → composite) | Makes hot magenta cores glow |
-| Display | Gradient shading, dark-indigo background, dithering |
+| Bloom (prefilter → blur pyramid → composite) | Makes hot cores glow |
+| Sunrays | Radial light shafts driven by the dye's luminance |
+| Display | Gradient shading, ACES filmic tonemap, dark-indigo background, dithering |
+
+## Controls
+
+| Input | Effect |
+|---|---|
+| Drag (mouse or finger) | Stir — speed scales splat size and brightness |
+| Double-tap / double-click | Radial shockwave burst |
+| Triple-tap or `c` | Cycle color theme (Spectrum, Nebula, Ember, Glacier) |
+| Tilt the phone (iOS) | Gravity pours the dye (permission asked on first touch) |
+| 🎙️ button or `m` | Music reactivity — the fluid pulses with bass |
+| `space` | Random splat burst |
 
 Velocity is simulated at ~144px, dye at ~1024px. Pointer movement injects a
 Gaussian velocity impulse (direction = pointer delta, force ≈ 6000) plus a dye

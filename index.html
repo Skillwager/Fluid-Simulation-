@@ -24,17 +24,68 @@
     touch-action: none;
     cursor: crosshair;
   }
+  #toast {
+    position: fixed;
+    top: max(24px, env(safe-area-inset-top));
+    left: 50%;
+    transform: translateX(-50%);
+    color: #fff;
+    font: 600 13px -apple-system, system-ui, sans-serif;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    background: rgba(20, 0, 40, 0.55);
+    padding: 9px 20px;
+    border-radius: 20px;
+    opacity: 0;
+    transition: opacity 0.4s;
+    pointer-events: none;
+    white-space: nowrap;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 10;
+  }
+  #toast.show { opacity: 1; }
+  #mic {
+    position: fixed;
+    right: max(14px, env(safe-area-inset-right));
+    bottom: max(14px, env(safe-area-inset-bottom));
+    font-size: 26px;
+    line-height: 1;
+    padding: 10px;
+    opacity: 0.35;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: opacity 0.3s, filter 0.3s;
+    z-index: 10;
+  }
+  #mic.active {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px #f0f);
+  }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="toast"></div>
+<div id="mic" title="Toggle music reactivity (m)">🎙️</div>
 <script>
 'use strict';
 
 // ============================================================================
 // Nebula — a GPU Navier-Stokes fluid simulation (Stam's "Stable Fluids")
-// Velocity is simulated at low resolution, dye at high resolution.
-// Every pass is a fragment shader over ping-pong half-float framebuffers.
+// Velocity is simulated at low resolution, dye at high resolution with
+// MacCormack error-corrected advection. Every pass is a fragment shader over
+// ping-pong half-float framebuffers.
+//
+// Interactions:
+//   drag            stir the fluid (speed scales splat size and brightness)
+//   double-tap      radial shockwave
+//   triple-tap / c  cycle color theme
+//   tilt (iOS)      gravity pours the dye
+//   mic button / m  music reactivity
+//   space           random splat burst
 // ============================================================================
 
 const config = {
@@ -47,6 +98,7 @@ const config = {
   CURL: 30,                   // vorticity confinement strength
   SPLAT_RADIUS: 0.0035,       // pointer splat radius (fraction of screen)
   SPLAT_FORCE: 6000,          // pointer velocity multiplier
+  MACCORMACK: true,           // error-corrected advection for the dye
   SHADING: true,              // pseudo-3D shading from dye gradient
   BLOOM: true,
   BLOOM_ITERATIONS: 8,
@@ -54,12 +106,28 @@ const config = {
   BLOOM_INTENSITY: 0.6,
   BLOOM_THRESHOLD: 0.55,
   BLOOM_SOFT_KNEE: 0.7,
+  SUNRAYS: true,              // radial light shafts from the dye's glow
+  SUNRAYS_RESOLUTION: 196,
+  SUNRAYS_WEIGHT: 0.8,
+  EXPOSURE: 1.15,             // pre-tonemap exposure
+  TILT_FORCE: 450,            // device-tilt gravity strength (iOS)
+  SHOCKWAVE_FORCE: 1100,      // double-tap radial burst velocity
   BACK_COLOR: { r: 8 / 255, g: 0, b: 17 / 255 },
   IDLE_SPLAT_INTERVAL: 2.5,   // seconds between ambient splats when idle
   HUE_DRIFT: 0.003,           // hue rotation per splat along a stroke
 };
 
+const THEMES = [
+  { name: 'Spectrum', hueMin: 0.0,  hueMax: 1.0,  drift: 0.003 },
+  { name: 'Nebula',   hueMin: 0.72, hueMax: 0.95, drift: 0.004 },
+  { name: 'Ember',    hueMin: 0.95, hueMax: 1.12, drift: 0.004 },
+  { name: 'Glacier',  hueMin: 0.48, hueMax: 0.68, drift: 0.004 },
+];
+let themeIndex = 0;
+
 const canvas = document.getElementById('c');
+const toastEl = document.getElementById('toast');
+const micBtn = document.getElementById('mic');
 
 // ---------------------------------------------------------------------------
 // WebGL context + capability probing
@@ -134,6 +202,8 @@ if (!ext.supportLinearFiltering) {
   config.DYE_RESOLUTION = 512;
   config.SHADING = false;
   config.BLOOM = false;
+  config.SUNRAYS = false;
+  config.MACCORMACK = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +291,21 @@ const clearShader = compileShader(gl.FRAGMENT_SHADER, `
   }
 `);
 
+const blurShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision mediump float;
+  precision mediump sampler2D;
+  varying vec2 vUv;
+  varying vec2 vL;
+  varying vec2 vR;
+  uniform sampler2D uTexture;
+  void main () {
+    vec4 sum = texture2D(uTexture, vUv) * 0.29411764;
+    sum += texture2D(uTexture, vL) * 0.35294117;
+    sum += texture2D(uTexture, vR) * 0.35294117;
+    gl_FragColor = sum;
+  }
+`);
+
 const splatShader = compileShader(gl.FRAGMENT_SHADER, `
   precision highp float;
   precision highp sampler2D;
@@ -273,6 +358,55 @@ const advectionShader = compileShader(gl.FRAGMENT_SHADER, `
     gl_FragColor = result / decay;
   }
 `, ext.supportLinearFiltering ? null : ['MANUAL_FILTERING']);
+
+// MacCormack error correction: forward + backward semi-Lagrangian passes give
+// an error estimate; the corrected result is clamped to the neighborhood of
+// the backtraced sample to stay stable. Dramatically sharper filaments.
+const maccormackShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float;
+  precision highp sampler2D;
+  varying vec2 vUv;
+  uniform sampler2D uVelocity;
+  uniform sampler2D uSource;
+  uniform sampler2D uForward;
+  uniform sampler2D uBackward;
+  uniform vec2 texelSize;
+  uniform vec2 sourceTexelSize;
+  uniform float dt;
+  uniform float dissipation;
+  void main () {
+    vec4 result = texture2D(uForward, vUv)
+                + 0.5 * (texture2D(uSource, vUv) - texture2D(uBackward, vUv));
+    vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize;
+    vec2 st = coord / sourceTexelSize - 0.5;
+    vec2 iuv = floor(st);
+    vec4 a = texture2D(uSource, (iuv + vec2(0.5, 0.5)) * sourceTexelSize);
+    vec4 b = texture2D(uSource, (iuv + vec2(1.5, 0.5)) * sourceTexelSize);
+    vec4 c = texture2D(uSource, (iuv + vec2(0.5, 1.5)) * sourceTexelSize);
+    vec4 d = texture2D(uSource, (iuv + vec2(1.5, 1.5)) * sourceTexelSize);
+    result = clamp(result, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+    float decay = 1.0 + dissipation * dt;
+    gl_FragColor = result / decay;
+  }
+`);
+
+// density-weighted body force: tilting the device pours the dye
+const gravityShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float;
+  precision highp sampler2D;
+  varying vec2 vUv;
+  uniform sampler2D uVelocity;
+  uniform sampler2D uDye;
+  uniform vec2 force;
+  uniform float dt;
+  void main () {
+    vec3 d = texture2D(uDye, vUv).rgb;
+    float density = min(max(d.r, max(d.g, d.b)), 1.0);
+    vec2 v = texture2D(uVelocity, vUv).xy;
+    v += force * density * dt;
+    gl_FragColor = vec4(v, 0.0, 1.0);
+  }
+`);
 
 const divergenceShader = compileShader(gl.FRAGMENT_SHADER, `
   precision mediump float;
@@ -444,6 +578,45 @@ const bloomFinalShader = compileShader(gl.FRAGMENT_SHADER, `
   }
 `);
 
+const sunraysMaskShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float;
+  precision highp sampler2D;
+  varying vec2 vUv;
+  uniform sampler2D uTexture;
+  void main () {
+    vec4 c = texture2D(uTexture, vUv);
+    float br = max(c.r, max(c.g, c.b));
+    c.a = 1.0 - min(max(br * 20.0, 0.0), 0.8);
+    gl_FragColor = c;
+  }
+`);
+
+const sunraysShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float;
+  precision highp sampler2D;
+  varying vec2 vUv;
+  uniform sampler2D uTexture;
+  uniform float weight;
+  #define ITERATIONS 16
+  void main () {
+    float Density = 0.3;
+    float Decay = 0.95;
+    float Exposure = 0.7;
+    vec2 coord = vUv;
+    vec2 dir = vUv - 0.5;
+    dir *= 1.0 / float(ITERATIONS) * Density;
+    float illuminationDecay = 1.0;
+    float color = texture2D(uTexture, vUv).a;
+    for (int i = 0; i < ITERATIONS; i++) {
+      coord -= dir;
+      float col = texture2D(uTexture, coord).a;
+      color += col * illuminationDecay * weight;
+      illuminationDecay *= Decay;
+    }
+    gl_FragColor = vec4(color * Exposure, 0.0, 0.0, 1.0);
+  }
+`);
+
 const displayShader = compileShader(gl.FRAGMENT_SHADER, `
   precision highp float;
   precision highp sampler2D;
@@ -454,17 +627,24 @@ const displayShader = compileShader(gl.FRAGMENT_SHADER, `
   varying vec2 vB;
   uniform sampler2D uTexture;
   uniform sampler2D uBloom;
+  uniform sampler2D uSunrays;
   uniform vec3 backColor;
   uniform vec2 texelSize;
+  uniform float exposure;
 
-  // hash-based dithering: kills banding in the smooth purple gradients
+  // hash-based dithering: kills banding in the smooth gradients
   float hash (vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
   }
 
-  vec3 linearToGamma (vec3 color) {
-    color = max(color, vec3(0.0));
-    return max(1.055 * pow(color, vec3(0.416666667)) - 0.055, vec3(0.0));
+  // ACES filmic tonemap: highlights roll off like film instead of clipping
+  vec3 aces (vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
   }
 
   void main () {
@@ -484,10 +664,15 @@ const displayShader = compileShader(gl.FRAGMENT_SHADER, `
   #endif
 
   #ifdef BLOOM
-    vec3 bloom = texture2D(uBloom, vUv).rgb;
-    bloom = linearToGamma(bloom);
-    c += bloom;
+    c += texture2D(uBloom, vUv).rgb;
   #endif
+
+  #ifdef SUNRAYS
+    float sunrays = texture2D(uSunrays, vUv).r;
+    c *= 0.6 + sunrays;
+  #endif
+
+    c = aces(c * exposure);
 
     float a = max(c.r, max(c.g, c.b));
     c = mix(backColor, c, clamp(a * 4.0, 0.0, 1.0));
@@ -499,6 +684,7 @@ const displayShader = compileShader(gl.FRAGMENT_SHADER, `
   const keywords = [];
   if (config.SHADING) keywords.push('SHADING');
   if (config.BLOOM) keywords.push('BLOOM');
+  if (config.SUNRAYS) keywords.push('SUNRAYS');
   return keywords.length ? keywords : null;
 })());
 
@@ -597,7 +783,9 @@ function getResolution(resolution) {
 }
 
 let dye, velocity, divergence, curl, pressure;
+let dyeTemp1, dyeTemp2;
 let bloom, bloomFramebuffers = [];
+let sunrays, sunraysTemp;
 
 function initFramebuffers() {
   const simRes = getResolution(config.SIM_RESOLUTION);
@@ -623,7 +811,12 @@ function initFramebuffers() {
   curl = createFBO(simRes.width, simRes.height, r.internalFormat, r.format, texType, gl.NEAREST);
   pressure = createDoubleFBO(simRes.width, simRes.height, r.internalFormat, r.format, texType, gl.NEAREST);
 
+  if (config.MACCORMACK) {
+    dyeTemp1 = createFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, texType, filtering);
+    dyeTemp2 = createFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, texType, filtering);
+  }
   if (config.BLOOM) initBloomFramebuffers();
+  if (config.SUNRAYS) initSunraysFramebuffers();
 }
 
 function initBloomFramebuffers() {
@@ -642,22 +835,94 @@ function initBloomFramebuffers() {
   }
 }
 
+function initSunraysFramebuffers() {
+  const res = getResolution(config.SUNRAYS_RESOLUTION);
+  const texType = ext.halfFloatTexType;
+  const r = ext.formatR;
+  const filtering = ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST;
+  sunrays = createFBO(res.width, res.height, r.internalFormat, r.format, texType, filtering);
+  sunraysTemp = createFBO(res.width, res.height, r.internalFormat, r.format, texType, filtering);
+}
+
 // ---------------------------------------------------------------------------
 // Programs
 // ---------------------------------------------------------------------------
-const copyProgram            = new Program(baseVertexShader, copyShader);
-const clearProgram           = new Program(baseVertexShader, clearShader);
-const splatProgram           = new Program(baseVertexShader, splatShader);
-const advectionProgram       = new Program(baseVertexShader, advectionShader);
-const divergenceProgram      = new Program(baseVertexShader, divergenceShader);
-const curlProgram            = new Program(baseVertexShader, curlShader);
-const vorticityProgram       = new Program(baseVertexShader, vorticityShader);
-const pressureProgram        = new Program(baseVertexShader, pressureShader);
+const copyProgram             = new Program(baseVertexShader, copyShader);
+const clearProgram            = new Program(baseVertexShader, clearShader);
+const blurProgram             = new Program(baseVertexShader, blurShader);
+const splatProgram            = new Program(baseVertexShader, splatShader);
+const advectionProgram        = new Program(baseVertexShader, advectionShader);
+const maccormackProgram       = new Program(baseVertexShader, maccormackShader);
+const gravityProgram          = new Program(baseVertexShader, gravityShader);
+const divergenceProgram       = new Program(baseVertexShader, divergenceShader);
+const curlProgram             = new Program(baseVertexShader, curlShader);
+const vorticityProgram        = new Program(baseVertexShader, vorticityShader);
+const pressureProgram         = new Program(baseVertexShader, pressureShader);
 const gradientSubtractProgram = new Program(baseVertexShader, gradientSubtractShader);
-const bloomPrefilterProgram  = new Program(baseVertexShader, bloomPrefilterShader);
-const bloomBlurProgram       = new Program(baseVertexShader, bloomBlurShader);
-const bloomFinalProgram      = new Program(baseVertexShader, bloomFinalShader);
-const displayProgram         = new Program(baseVertexShader, displayShader);
+const bloomPrefilterProgram   = new Program(baseVertexShader, bloomPrefilterShader);
+const bloomBlurProgram        = new Program(baseVertexShader, bloomBlurShader);
+const bloomFinalProgram       = new Program(baseVertexShader, bloomFinalShader);
+const sunraysMaskProgram      = new Program(baseVertexShader, sunraysMaskShader);
+const sunraysProgram          = new Program(baseVertexShader, sunraysShader);
+const displayProgram          = new Program(baseVertexShader, displayShader);
+
+// ---------------------------------------------------------------------------
+// Colors & themes
+// ---------------------------------------------------------------------------
+function HSVtoRGB(h, s, v) {
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  let r, g, b;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    case 5: r = v; g = p; b = q; break;
+  }
+  return { r, g, b };
+}
+
+// maps an abstract 0..1 hue parameter into the active theme's band: the full
+// wheel for Spectrum, a triangle-wave sweep through the band for the others
+function colorFromHue(t) {
+  const theme = THEMES[themeIndex];
+  const range = theme.hueMax - theme.hueMin;
+  let hue;
+  if (range >= 1.0) {
+    hue = t % 1.0;
+  } else {
+    const tri = 1.0 - Math.abs(2.0 * (t % 1.0) - 1.0);
+    hue = (theme.hueMin + tri * range) % 1.0;
+  }
+  const c = HSVtoRGB((hue + 1.0) % 1.0, 1.0, 1.0);
+  c.r *= 0.15;
+  c.g *= 0.15;
+  c.b *= 0.15;
+  return c;
+}
+
+function generateColor() {
+  return colorFromHue(Math.random());
+}
+
+let toastTimer = null;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1600);
+}
+
+function cycleTheme() {
+  themeIndex = (themeIndex + 1) % THEMES.length;
+  pointers.forEach(p => { p.color = colorFromHue(p.hue); });
+  toast(THEMES[themeIndex].name);
+}
 
 // ---------------------------------------------------------------------------
 // Pointers — mouse + multi-touch
@@ -676,38 +941,6 @@ function pointerPrototype() {
 }
 
 const pointers = [pointerPrototype()];
-
-// full-spectrum palette: every stroke seeds its own hue and drifts through
-// the rainbow as it moves (see splatPointer)
-function colorFromHue(hue) {
-  const c = HSVtoRGB(hue % 1.0, 1.0, 1.0);
-  c.r *= 0.15;
-  c.g *= 0.15;
-  c.b *= 0.15;
-  return c;
-}
-
-function generateColor() {
-  return colorFromHue(Math.random());
-}
-
-function HSVtoRGB(h, s, v) {
-  const i = Math.floor(h * 6);
-  const f = h * 6 - i;
-  const p = v * (1 - s);
-  const q = v * (1 - f * s);
-  const t = v * (1 - (1 - f) * s);
-  let r, g, b;
-  switch (i % 6) {
-    case 0: r = v; g = t; b = p; break;
-    case 1: r = q; g = v; b = p; break;
-    case 2: r = p; g = v; b = t; break;
-    case 3: r = p; g = q; b = v; break;
-    case 4: r = t; g = p; b = v; break;
-    case 5: r = v; g = p; b = q; break;
-  }
-  return { r, g, b };
-}
 
 function scaleByPixelRatio(input) {
   const pixelRatio = window.devicePixelRatio || 1;
@@ -770,8 +1003,20 @@ window.addEventListener('mouseup', () => {
   pointers[0].down = false;
 });
 
+canvas.addEventListener('dblclick', e => {
+  const posX = scaleByPixelRatio(e.offsetX);
+  const posY = scaleByPixelRatio(e.offsetY);
+  shockwave(posX / canvas.width, 1 - posY / canvas.height);
+  lastInteraction = performance.now();
+});
+
+// tap tracking for double-tap (shockwave) and triple-tap (theme)
+let tapCount = 0, lastTapTime = 0;
+let touchStartTime = 0, touchStartX = 0, touchStartY = 0;
+
 canvas.addEventListener('touchstart', e => {
   e.preventDefault();
+  enableTilt();
   const touches = e.targetTouches;
   while (touches.length >= pointers.length)
     pointers.push(pointerPrototype());
@@ -779,6 +1024,11 @@ canvas.addEventListener('touchstart', e => {
     const posX = scaleByPixelRatio(touches[i].clientX);
     const posY = scaleByPixelRatio(touches[i].clientY);
     updatePointerDownData(pointers[i + 1], touches[i].identifier, posX, posY);
+  }
+  if (touches.length === 1) {
+    touchStartTime = performance.now();
+    touchStartX = touches[0].clientX;
+    touchStartY = touches[0].clientY;
   }
   lastInteraction = performance.now();
 }, { passive: false });
@@ -803,7 +1053,110 @@ window.addEventListener('touchend', e => {
     if (!pointer) continue;
     pointer.down = false;
   }
+  // tap detection: short touch with little movement
+  if (e.targetTouches.length === 0 && touches.length === 1) {
+    const now = performance.now();
+    const duration = now - touchStartTime;
+    const dist = Math.hypot(touches[0].clientX - touchStartX, touches[0].clientY - touchStartY);
+    if (duration < 250 && dist < 20) {
+      tapCount = (now - lastTapTime < 350) ? tapCount + 1 : 1;
+      lastTapTime = now;
+      const tx = scaleByPixelRatio(touches[0].clientX) / canvas.width;
+      const ty = 1 - scaleByPixelRatio(touches[0].clientY) / canvas.height;
+      if (tapCount === 2) shockwave(tx, ty);
+      if (tapCount === 3) { cycleTheme(); tapCount = 0; }
+    }
+  }
 });
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'KeyC' || e.code === 'KeyT') cycleTheme();
+  else if (e.code === 'KeyM') toggleMic();
+  else if (e.code === 'Space') {
+    e.preventDefault();
+    multipleSplats(Math.floor(Math.random() * 4) + 4);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Device tilt → gravity (iOS requires a permission prompt from a user gesture)
+// ---------------------------------------------------------------------------
+let tiltX = 0, tiltY = 0;
+let motionRequested = false;
+
+function handleMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  // accelerometer reads the reaction force, so gravity = -accel; normalize to g
+  let fx = -(a.x || 0) / 9.81;
+  let fy = -(a.y || 0) / 9.81;
+  // rotate the device-frame vector into screen space
+  const angle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+  const rad = -angle * Math.PI / 180;
+  tiltX = fx * Math.cos(rad) - fy * Math.sin(rad);
+  tiltY = fx * Math.sin(rad) + fy * Math.cos(rad);
+}
+
+function enableTilt() {
+  if (motionRequested) return;
+  motionRequested = true;
+  if (typeof DeviceMotionEvent === 'undefined') return;
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    DeviceMotionEvent.requestPermission().then(state => {
+      if (state === 'granted') {
+        window.addEventListener('devicemotion', handleMotion);
+        toast('Tilt to pour');
+      }
+    }).catch(() => {});
+  } else {
+    window.addEventListener('devicemotion', handleMotion);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Audio reactivity — the fluid pulses with bass from the microphone
+// ---------------------------------------------------------------------------
+let audioCtx = null, analyser = null, audioData = null, micStream = null, micActive = false;
+let bassSmooth = 0, lastBeat = 0;
+
+async function toggleMic() {
+  if (micActive) {
+    micStream.getTracks().forEach(t => t.stop());
+    audioCtx.close();
+    micActive = false;
+    micBtn.classList.remove('active');
+    toast('Mic off');
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+    audioData = new Uint8Array(analyser.frequencyBinCount);
+    micActive = true;
+    micBtn.classList.add('active');
+    toast('Listening — play some music');
+  } catch (err) {
+    toast('Mic unavailable');
+  }
+}
+
+micBtn.addEventListener('click', toggleMic);
+
+function audioSplat(level) {
+  const color = colorFromHue(Math.random());
+  const m = 4 + level * 10;
+  color.r *= m; color.g *= m; color.b *= m;
+  const x = 0.2 + Math.random() * 0.6;
+  const y = 0.2 + Math.random() * 0.6;
+  const angle = Math.random() * Math.PI * 2;
+  const speed = 300 + level * 1400;
+  splat(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, color,
+        config.SPLAT_RADIUS * (1.5 + level * 3));
+}
 
 // ---------------------------------------------------------------------------
 // Splats
@@ -814,13 +1167,13 @@ function correctRadius(radius) {
   return radius;
 }
 
-function splat(x, y, dx, dy, color) {
+function splat(x, y, dx, dy, color, radius) {
   splatProgram.bind();
   gl.uniform1i(splatProgram.uniforms.uTarget, velocity.read.attach(0));
   gl.uniform1f(splatProgram.uniforms.aspectRatio, canvas.width / canvas.height);
   gl.uniform2f(splatProgram.uniforms.point, x, y);
   gl.uniform3f(splatProgram.uniforms.color, dx, dy, 0);
-  gl.uniform1f(splatProgram.uniforms.radius, correctRadius(config.SPLAT_RADIUS));
+  gl.uniform1f(splatProgram.uniforms.radius, correctRadius(radius || config.SPLAT_RADIUS));
   blit(velocity.write);
   velocity.swap();
 
@@ -831,11 +1184,20 @@ function splat(x, y, dx, dy, color) {
 }
 
 function splatPointer(pointer) {
-  pointer.hue = (pointer.hue + config.HUE_DRIFT) % 1.0;
+  pointer.hue = (pointer.hue + THEMES[themeIndex].drift) % 1.0;
   pointer.color = colorFromHue(pointer.hue);
+  // velocity-reactive: flicks burst wide and bright, slow drags etch thin lines
+  const speed = Math.hypot(pointer.deltaX, pointer.deltaY);
+  const radius = config.SPLAT_RADIUS * (0.5 + Math.min(speed * 25, 1.8));
+  const brightness = 0.5 + Math.min(speed * 40, 2.5);
+  const color = {
+    r: pointer.color.r * brightness,
+    g: pointer.color.g * brightness,
+    b: pointer.color.b * brightness,
+  };
   const dx = pointer.deltaX * config.SPLAT_FORCE;
   const dy = pointer.deltaY * config.SPLAT_FORCE;
-  splat(pointer.texcoordX, pointer.texcoordY, dx, dy, pointer.color);
+  splat(pointer.texcoordX, pointer.texcoordY, dx, dy, color, radius);
 }
 
 function multipleSplats(amount) {
@@ -864,11 +1226,38 @@ function ambientSplat() {
   splat(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, color);
 }
 
+function shockwave(x, y) {
+  const count = 14;
+  const baseHue = Math.random();
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2;
+    const color = colorFromHue(baseHue + (i / count) * 0.3);
+    color.r *= 8; color.g *= 8; color.b *= 8;
+    splat(x, y,
+          Math.cos(angle) * config.SHOCKWAVE_FORCE,
+          Math.sin(angle) * config.SHOCKWAVE_FORCE,
+          color, config.SPLAT_RADIUS * 1.5);
+  }
+  lastInteraction = performance.now();
+}
+
 // ---------------------------------------------------------------------------
 // Simulation steps
 // ---------------------------------------------------------------------------
 function step(dt) {
   gl.disable(gl.BLEND);
+
+  // device-tilt gravity: density-weighted so the dye pours, the void doesn't
+  if (Math.abs(tiltX) > 0.05 || Math.abs(tiltY) > 0.05) {
+    gravityProgram.bind();
+    gl.uniform2f(gravityProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(gravityProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(gravityProgram.uniforms.uDye, dye.read.attach(1));
+    gl.uniform2f(gravityProgram.uniforms.force, tiltX * config.TILT_FORCE, tiltY * config.TILT_FORCE);
+    gl.uniform1f(gravityProgram.uniforms.dt, dt);
+    blit(velocity.write);
+    velocity.swap();
+  }
 
   curlProgram.bind();
   gl.uniform2f(curlProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
@@ -911,6 +1300,7 @@ function step(dt) {
   blit(velocity.write);
   velocity.swap();
 
+  // velocity advection: semi-Lagrangian (kept first-order for stability)
   advectionProgram.bind();
   gl.uniform2f(advectionProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
   if (!ext.supportLinearFiltering)
@@ -923,13 +1313,40 @@ function step(dt) {
   blit(velocity.write);
   velocity.swap();
 
-  if (!ext.supportLinearFiltering)
-    gl.uniform2f(advectionProgram.uniforms.dyeTexelSize, dye.texelSizeX, dye.texelSizeY);
-  gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
-  gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
-  gl.uniform1f(advectionProgram.uniforms.dissipation, config.DENSITY_DISSIPATION);
-  blit(dye.write);
-  dye.swap();
+  // dye advection: MacCormack (forward, backward, error-correct, clamp)
+  if (config.MACCORMACK) {
+    advectionProgram.bind();
+    gl.uniform2f(advectionProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
+    gl.uniform1f(advectionProgram.uniforms.dt, dt);
+    gl.uniform1f(advectionProgram.uniforms.dissipation, 0.0);
+    blit(dyeTemp1);
+
+    gl.uniform1i(advectionProgram.uniforms.uSource, dyeTemp1.attach(1));
+    gl.uniform1f(advectionProgram.uniforms.dt, -dt);
+    blit(dyeTemp2);
+
+    maccormackProgram.bind();
+    gl.uniform2f(maccormackProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform2f(maccormackProgram.uniforms.sourceTexelSize, dye.texelSizeX, dye.texelSizeY);
+    gl.uniform1i(maccormackProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(maccormackProgram.uniforms.uSource, dye.read.attach(1));
+    gl.uniform1i(maccormackProgram.uniforms.uForward, dyeTemp1.attach(2));
+    gl.uniform1i(maccormackProgram.uniforms.uBackward, dyeTemp2.attach(3));
+    gl.uniform1f(maccormackProgram.uniforms.dt, dt);
+    gl.uniform1f(maccormackProgram.uniforms.dissipation, config.DENSITY_DISSIPATION);
+    blit(dye.write);
+    dye.swap();
+  } else {
+    if (!ext.supportLinearFiltering)
+      gl.uniform2f(advectionProgram.uniforms.dyeTexelSize, dye.texelSizeX, dye.texelSizeY);
+    gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
+    gl.uniform1f(advectionProgram.uniforms.dissipation, config.DENSITY_DISSIPATION);
+    blit(dye.write);
+    dye.swap();
+  }
 }
 
 function applyBloom(source, destination) {
@@ -975,8 +1392,36 @@ function applyBloom(source, destination) {
   blit(destination);
 }
 
+function applySunrays(source, mask, destination) {
+  gl.disable(gl.BLEND);
+  sunraysMaskProgram.bind();
+  gl.uniform1i(sunraysMaskProgram.uniforms.uTexture, source.attach(0));
+  blit(mask);
+
+  sunraysProgram.bind();
+  gl.uniform1f(sunraysProgram.uniforms.weight, config.SUNRAYS_WEIGHT);
+  gl.uniform1i(sunraysProgram.uniforms.uTexture, mask.attach(0));
+  blit(destination);
+}
+
+function blurPass(target, temp, iterations) {
+  blurProgram.bind();
+  for (let i = 0; i < iterations; i++) {
+    gl.uniform2f(blurProgram.uniforms.texelSize, target.texelSizeX, 0.0);
+    gl.uniform1i(blurProgram.uniforms.uTexture, target.attach(0));
+    blit(temp);
+    gl.uniform2f(blurProgram.uniforms.texelSize, 0.0, target.texelSizeY);
+    gl.uniform1i(blurProgram.uniforms.uTexture, temp.attach(0));
+    blit(target);
+  }
+}
+
 function render() {
   if (config.BLOOM) applyBloom(dye.read, bloom);
+  if (config.SUNRAYS) {
+    applySunrays(dye.read, dye.write, sunrays);
+    blurPass(sunrays, sunraysTemp, 1);
+  }
 
   gl.disable(gl.BLEND);
   displayProgram.bind();
@@ -984,7 +1429,10 @@ function render() {
   gl.uniform1i(displayProgram.uniforms.uTexture, dye.read.attach(0));
   if (config.BLOOM)
     gl.uniform1i(displayProgram.uniforms.uBloom, bloom.attach(1));
+  if (config.SUNRAYS)
+    gl.uniform1i(displayProgram.uniforms.uSunrays, sunrays.attach(2));
   gl.uniform3f(displayProgram.uniforms.backColor, config.BACK_COLOR.r, config.BACK_COLOR.g, config.BACK_COLOR.b);
+  gl.uniform1f(displayProgram.uniforms.exposure, config.EXPOSURE);
   blit(null);
 }
 
@@ -1030,6 +1478,20 @@ function update() {
     }
   });
 
+  // music reactivity: beat-detect on low-frequency energy
+  if (micActive && analyser) {
+    analyser.getByteFrequencyData(audioData);
+    let sum = 0;
+    for (let i = 1; i <= 10; i++) sum += audioData[i];
+    const bass = sum / (10 * 255);
+    if (bass > bassSmooth * 1.15 && bass > 0.3 && now - lastBeat > 180) {
+      lastBeat = now;
+      audioSplat(bass);
+      lastInteraction = now;
+    }
+    bassSmooth += (bass - bassSmooth) * 0.25;
+  }
+
   // ambient life when idle
   if (now - lastInteraction > 4000 && now - lastAmbientTime > config.IDLE_SPLAT_INTERVAL * 1000) {
     lastAmbientTime = now;
@@ -1044,6 +1506,7 @@ resizeCanvas();
 initFramebuffers();
 multipleSplats(Math.floor(Math.random() * 5) + 8);
 update();
+setTimeout(() => toast('Drag to stir · double-tap to burst · triple-tap for themes'), 600);
 </script>
 </body>
 </html>

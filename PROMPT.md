@@ -88,6 +88,7 @@ dye is what you look at.
 
 Each line below is a self-contained clause you can append to the prompt to raise the
 ceiling. They are ordered by visual impact per unit of complexity.
+**All eight are now implemented in `index.html`.**
 
 1. **MacCormack advection** — "Replace semi-Lagrangian advection with MacCormack
    (forward + backward advect, error-correct, clamp to neighborhood min/max)."
