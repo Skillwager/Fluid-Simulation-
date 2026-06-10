@@ -51,10 +51,13 @@ dye is what you look at.
 
 ## Rendering — make it cinematic, not clinical
 
-- **Palette**: deep violet → electric purple → hot magenta → near-white orchid
-  (the reference image: glowing magenta cores bleeding into dark indigo voids).
-  Sample stroke hues from a narrow band (HSV hue ≈ 0.72–0.95, full saturation) so
-  every interaction stays inside the purple family but no two strokes match.
+- **Palette**: full-spectrum, but *organized*, never random-confetti. Each stroke
+  (each mouse-down, each finger) seeds its own hue at full saturation, and that hue
+  **drifts slowly along the stroke** (~0.003 of the color wheel per splat), so a
+  single long drag leaves a ribbon that melts from cyan through green into gold —
+  adjacent colors blend in the fluid into iridescent, oil-slick gradients instead
+  of clashing. Multi-finger gestures interleave ribbons from different points on
+  the wheel.
 - **Background**: near-black indigo (#080011), never pure black — the fluid should
   feel lit from within, floating in dark space.
 - **Bloom**: bright-pass threshold + iterative downsample/upsample Gaussian blur,
@@ -78,3 +81,31 @@ dye is what you look at.
   to the CPU.
 - Pause the simulation when the tab is hidden; resize FBOs on orientation change.
 - Zero console errors, zero external assets, works from `file://`.
+
+---
+
+## Enhancement levers — how to push this prompt further
+
+Each line below is a self-contained clause you can append to the prompt to raise the
+ceiling. They are ordered by visual impact per unit of complexity.
+
+1. **MacCormack advection** — "Replace semi-Lagrangian advection with MacCormack
+   (forward + backward advect, error-correct, clamp to neighborhood min/max)."
+   Dramatically sharper filaments and curls; the single biggest fidelity upgrade.
+2. **Sunrays / god-rays** — "Add a radial-blur light-shaft pass driven by the dye's
+   luminance, composited under the bloom." Gives the smoke volumetric backlighting.
+3. **Velocity-reactive splats** — "Scale splat radius and brightness with pointer
+   speed, so flicks burst and slow drags etch thin lines."
+4. **Device tilt as gravity** — "On iOS, read DeviceMotion and add the gravity
+   vector as a uniform body force, so tilting the phone pours the fluid."
+   (Requires the iOS permission prompt on first touch.)
+5. **Double-tap shockwave** — "On double-tap/double-click, emit a ring of 8–16
+   radial splats from the tap point."
+6. **HDR tonemapping** — "Accumulate dye in linear HDR and apply ACES filmic
+   tonemapping at display time," for highlights that roll off like film instead
+   of clipping.
+7. **Color themes** — "Expose named palettes (full-spectrum, nebula purple, ember,
+   glacier) selected by a key press / triple-tap, each defined as an HSV band +
+   drift rate." The purple band from the reference image is hue 0.72–0.95.
+8. **Audio reactivity** — "With mic permission, map low-frequency energy to ambient
+   splat force so the fluid pulses with music." (Needs a user gesture to start.)

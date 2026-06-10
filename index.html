@@ -56,6 +56,7 @@ const config = {
   BLOOM_SOFT_KNEE: 0.7,
   BACK_COLOR: { r: 8 / 255, g: 0, b: 17 / 255 },
   IDLE_SPLAT_INTERVAL: 2.5,   // seconds between ambient splats when idle
+  HUE_DRIFT: 0.003,           // hue rotation per splat along a stroke
 };
 
 const canvas = document.getElementById('c');
@@ -669,21 +670,25 @@ function pointerPrototype() {
     deltaX: 0, deltaY: 0,
     down: false,
     moved: false,
+    hue: 0,
     color: { r: 0.1, g: 0, b: 0.2 },
   };
 }
 
 const pointers = [pointerPrototype()];
 
-// purple family: deep violet through electric purple to hot magenta
-function generateColor() {
-  const hue = 0.72 + Math.random() * 0.23;       // violet..magenta band
-  const value = 0.8 + Math.random() * 0.2;
-  const c = HSVtoRGB(hue % 1.0, 1.0, value);
+// full-spectrum palette: every stroke seeds its own hue and drifts through
+// the rainbow as it moves (see splatPointer)
+function colorFromHue(hue) {
+  const c = HSVtoRGB(hue % 1.0, 1.0, 1.0);
   c.r *= 0.15;
   c.g *= 0.15;
   c.b *= 0.15;
   return c;
+}
+
+function generateColor() {
+  return colorFromHue(Math.random());
 }
 
 function HSVtoRGB(h, s, v) {
@@ -719,7 +724,8 @@ function updatePointerDownData(pointer, id, posX, posY) {
   pointer.prevTexcoordY = pointer.texcoordY;
   pointer.deltaX = 0;
   pointer.deltaY = 0;
-  pointer.color = generateColor();
+  pointer.hue = Math.random();
+  pointer.color = colorFromHue(pointer.hue);
 }
 
 function updatePointerMoveData(pointer, posX, posY) {
@@ -753,7 +759,8 @@ canvas.addEventListener('mousemove', e => {
     pointer.prevTexcoordX = pointer.texcoordX;
     pointer.prevTexcoordY = pointer.texcoordY;
     pointer.down = true;
-    pointer.color = generateColor();
+    pointer.hue = Math.random();
+    pointer.color = colorFromHue(pointer.hue);
   }
   updatePointerMoveData(pointer, posX, posY);
   lastInteraction = performance.now();
@@ -824,6 +831,8 @@ function splat(x, y, dx, dy, color) {
 }
 
 function splatPointer(pointer) {
+  pointer.hue = (pointer.hue + config.HUE_DRIFT) % 1.0;
+  pointer.color = colorFromHue(pointer.hue);
   const dx = pointer.deltaX * config.SPLAT_FORCE;
   const dy = pointer.deltaY * config.SPLAT_FORCE;
   splat(pointer.texcoordX, pointer.texcoordY, dx, dy, pointer.color);

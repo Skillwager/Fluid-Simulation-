@@ -1,10 +1,10 @@
 # Nebula — Interactive Fluid Dynamics
 
 A real-time GPU fluid simulation in a single `index.html`. Move your mouse (desktop)
-or drag your fingers (iOS — multi-touch) to stir glowing purple-magenta dye through
+or drag your fingers (iOS — multi-touch) to stir glowing full-spectrum dye through
 an incompressible Navier–Stokes velocity field.
 
-![reference aesthetic](https://img.shields.io/badge/palette-violet→magenta-9400d3)
+**Live:** https://fluid-simulation-six.vercel.app
 
 ## Run it
 
@@ -30,8 +30,9 @@ half-float framebuffers (WebGL2, with a WebGL1 + `OES_texture_half_float` fallba
 
 Velocity is simulated at ~144px, dye at ~1024px. Pointer movement injects a
 Gaussian velocity impulse (direction = pointer delta, force ≈ 6000) plus a dye
-splat colored from a violet→magenta hue band, so fast flicks shear the fluid and
-slow drags fold it. Each finger on iOS gets its own tracked pointer and color.
+splat. Each stroke seeds its own hue and drifts slowly around the color wheel as
+it moves, so long drags leave ribbons that melt between adjacent colors. Each
+finger on iOS gets its own tracked pointer and hue.
 
 Tuning lives in the `config` object at the top of the script in `index.html`.
 
